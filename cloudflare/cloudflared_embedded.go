@@ -21,6 +21,7 @@ import (
 	"github.com/cloudflare/cloudflared/tlsconfig"
 	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 
 	"go.lumeweb.com/tunneler"
 )
@@ -96,6 +97,31 @@ func buildCloudflaredIngress(hostname, origin string) (ingress.Ingress, error) {
 	})
 }
 
+// buildOrchestrationConfig assembles the orchestration.Config for the embedded
+// daemon. It mirrors cmd/cloudflared/tunnel/configuration.go (newTunnelConfig):
+// cloudflared always wires a non-nil *ingress.OriginDialerService into the
+// config, because updateIngress — invoked by orchestration.NewOrchestrator
+// itself — calls OriginDialerService.UpdateDefaultDialer, which dereferences
+// the receiver and panics if the service was never set. The default dialer
+// dials origins directly over TCP/UDP using the warp-routing connect/keepalive
+// settings, and the TCP write timeout matches the supervisor's
+// WriteStreamTimeout. The reserved virtual-DNS service cloudflared also
+// registers is specific to WARP routing and is not used by this named-tunnel
+// daemon.
+func buildOrchestrationConfig(ingressRules ingress.Ingress, writeStreamTimeout time.Duration, log *zerolog.Logger) *orchestration.Config {
+	warpRoutingConfig := ingress.NewWarpRoutingConfig(&config.WarpRoutingConfig{})
+	originDialerService := ingress.NewOriginDialer(ingress.OriginConfig{
+		DefaultDialer:   ingress.NewDialer(warpRoutingConfig),
+		TCPWriteTimeout: writeStreamTimeout,
+	}, log)
+	return &orchestration.Config{
+		Ingress:             &ingressRules,
+		WarpRouting:         warpRoutingConfig,
+		OriginDialerService: originDialerService,
+		ConfigurationFlags:  map[string]string{},
+	}
+}
+
 // startEmbeddedCloudflared is the seam used to launch the embedded daemon
 // path. Production invokes the full launch below; tests redirect it to
 // simulate daemons (e.g. one that ignores cancellation) without constructing
@@ -128,13 +154,11 @@ func launchEmbeddedCloudflared(ctx context.Context, state *CloudflareTunnelState
 		return fmt.Errorf("parse ingress: %w", err)
 	}
 
+	orchestratorConfig := buildOrchestrationConfig(ing, time.Second*0, logTransport)
+
 	orchestrator, err := orchestration.NewOrchestrator(
 		ctx,
-		&orchestration.Config{
-			Ingress:            &ing,
-			WarpRouting:        ingress.NewWarpRoutingConfig(&config.WarpRoutingConfig{}),
-			ConfigurationFlags: map[string]string{},
-		},
+		orchestratorConfig,
 		[]pogs.Tag{},
 		[]ingress.Rule{},
 		logTransport,

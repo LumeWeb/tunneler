@@ -1,9 +1,14 @@
 package cloudflare
 
 import (
+	"context"
 	"encoding/base64"
 	"testing"
 
+	"github.com/cloudflare/cloudflared/ingress"
+	"github.com/cloudflare/cloudflared/logger"
+	"github.com/cloudflare/cloudflared/orchestration"
+	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -78,6 +83,33 @@ func TestBuildCloudflaredTunnelPropertiesMissingAccountID(t *testing.T) {
 func TestBuildCloudflaredTunnelPropertiesNilState(t *testing.T) {
 	_, err := buildCloudflaredTunnelProperties(nil)
 	require.Error(t, err)
+}
+
+func TestBuildOrchestrationConfigSetsOriginDialerService(t *testing.T) {
+	// Regression: the embedded daemon used to build an orchestration.Config
+	// without OriginDialerService. cloudflared's updateIngress — invoked by
+	// orchestration.NewOrchestrator itself — calls
+	// OriginDialerService.UpdateDefaultDialer, which dereferences the (nil)
+	// receiver, so a real Start() of the embedded tunnel panicked before any
+	// connection attempt. The real constructor path must produce a non-nil
+	// origin dialer service.
+	ing, err := buildCloudflaredIngress("mcp.example.com", "http://127.0.0.1:8893")
+	require.NoError(t, err)
+
+	log := logger.Create(logger.CreateConfig("", true, false, "", ""))
+	cfg := buildOrchestrationConfig(ing, 0, log)
+	require.NotNil(t, cfg.OriginDialerService)
+
+	// Exercise the REAL orchestrator construction exactly as the embedded
+	// daemon does. Against pre-fix code this panicked inside updateIngress
+	// when UpdateDefaultDialer was called on a nil service.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NotPanics(t, func() {
+		orchestrator, orcErr := orchestration.NewOrchestrator(ctx, cfg, []pogs.Tag{}, []ingress.Rule{}, log)
+		require.NoError(t, orcErr)
+		require.NotNil(t, orchestrator)
+	})
 }
 
 func TestBuildCloudflaredIngress(t *testing.T) {
