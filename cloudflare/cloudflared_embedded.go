@@ -124,16 +124,20 @@ func buildOrchestrationConfig(ingressRules ingress.Ingress, writeStreamTimeout t
 
 // startEmbeddedCloudflared is the seam used to launch the embedded daemon
 // path. Production invokes the full launch below; tests redirect it to
-// simulate daemons (e.g. one that ignores cancellation) without constructing
-// the cloudflared runtime.
-var startEmbeddedCloudflared = func(ctx context.Context, state *CloudflareTunnelState, origin string) error {
-	return launchEmbeddedCloudflared(ctx, state, origin)
+// simulate daemons (e.g. one that never fires the connected signal, or one
+// that ignores cancellation) without constructing the cloudflared runtime.
+// connected is the CONNECTED signal Start waits on: the embedded runtime (or a
+// test stub) notifies it once the edge connection is established. It is
+// created by Start and threaded through here because only the caller knows
+// when readiness is being awaited.
+var startEmbeddedCloudflared = func(ctx context.Context, state *CloudflareTunnelState, origin string, connected *signal.Signal) error {
+	return launchEmbeddedCloudflared(ctx, state, origin, connected)
 }
 
 // launchEmbeddedCloudflared builds and launches an in-process cloudflared NAMED
 // tunnel that routes state.Hostname to the given local origin. It blocks until
 // the daemon exits (on ctx cancellation or its own failure).
-func launchEmbeddedCloudflared(ctx context.Context, state *CloudflareTunnelState, origin string) error {
+func launchEmbeddedCloudflared(ctx context.Context, state *CloudflareTunnelState, origin string, connected *signal.Signal) error {
 	logTransport := logger.Create(logger.CreateConfig("", true, false, "", ""))
 
 	observer := connection.NewObserver(logTransport, logTransport)
@@ -166,8 +170,6 @@ func launchEmbeddedCloudflared(ctx context.Context, state *CloudflareTunnelState
 	if err != nil {
 		return fmt.Errorf("create orchestrator: %w", err)
 	}
-
-	connectedSignal := signal.New(make(chan struct{}))
 
 	// The selector derives the edge transport protocol solely from the flag;
 	// account-level edge-discovery tuning is handled internally by cloudflared.
@@ -232,5 +234,5 @@ func launchEmbeddedCloudflared(ctx context.Context, state *CloudflareTunnelState
 	}
 
 	shutdown := make(chan struct{})
-	return startTunnelDaemon(ctx, tunnelConfig, orchestrator, connectedSignal, shutdown)
+	return startTunnelDaemon(ctx, tunnelConfig, orchestrator, connected, shutdown)
 }

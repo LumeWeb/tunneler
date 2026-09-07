@@ -2,13 +2,11 @@ package cloudflare
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/cloudflared/signal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -16,8 +14,7 @@ import (
 )
 
 // TestCloudflaredStopAfterExit guards the exit-detection path of the embedded
-// tunnel: once the in-process daemon has shut down (done closed), waitReady
-// must observe the exit rather than spinning to its deadline, and a subsequent
+// tunnel: once the in-process daemon has shut down (done closed), a subsequent
 // Stop must return promptly instead of blocking.
 func TestCloudflaredStopAfterExit(t *testing.T) {
 	done := make(chan struct{})
@@ -25,13 +22,9 @@ func TestCloudflaredStopAfterExit(t *testing.T) {
 
 	c := &CloudflaredTunnel{done: done}
 
-	// waitReady must fail fast with the exit error, not time out.
+	// Stop must return promptly instead of blocking on the closed channel.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err := c.waitReady(ctx, "https://exited.invalid")
-	assert.ErrorContains(t, err, "exited before the tunnel became ready")
-
-	// Stop must return promptly instead of blocking on the closed channel.
 	started := time.Now()
 	assert.NoError(t, c.Stop(ctx))
 	assert.Less(t, time.Since(started), 3*time.Second, "Stop blocked after process exit")
@@ -71,89 +64,79 @@ func TestMissingTokenError(t *testing.T) {
 	require.ErrorContains(t, cf.MissingTokenError(), "cloudflared tunnel is not provisioned")
 }
 
-// TestWaitReadyRequiresSuccessStatus guards the readiness semantics: only a
-// genuine origin response (2xx-4xx) over the tunnel counts as ready; edge/
-// gateway-facing errors (5xx error pages like Cloudflare's 502/503/530, emitted
-// before the tunnel delivers to the origin) must not. waitReady must keep
-// polling through those instead of treating the first response (any status) as
-// ready.
-func TestWaitReadyRequiresSuccessStatus(t *testing.T) {
-	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		// Answer with 503 gateway error pages for the first three probes; only
-		// then does the tunnel "deliver to the origin" (200).
-		if atomic.AddInt32(&hits, 1) <= 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	c := &CloudflaredTunnel{}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	require.NoError(t, c.waitReady(ctx, srv.URL), "waitReady must return once the tunnel serves a success response")
-	// Against the old StatusCode > 0 logic waitReady returned on the very
-	// first probe (single hit); polling through the 503s proves the fix.
-	assert.GreaterOrEqual(t, atomic.LoadInt32(&hits), int32(4),
-		"waitReady must keep polling through 503 gateway error pages, not return on the first response")
-}
-
-// TestWaitReadyAcceptsOrigin4xx locks the cloudflare-specific readiness
-// semantics: named tunnels pass the ORIGIN's real status through the tunnel,
-// so a genuine 4xx (401/403/404) returned by the origin's probe path already
-// proves the tunnel is delivering to the origin. Only 5xx edge/gateway errors
-// mean "not ready yet". Under the previous 2xx/3xx-only gate (code < 400)
-// waitReady would have polled until its deadline and failed, so this test
-// fails against the pre-refinement code.
-func TestWaitReadyAcceptsOrigin4xx(t *testing.T) {
-	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
-
-	c := &CloudflaredTunnel{}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	require.NoError(t, c.waitReady(ctx, srv.URL),
-		"waitReady must treat a genuine origin 4xx as ready — the tunnel is already delivering the origin's response")
-	assert.GreaterOrEqual(t, atomic.LoadInt32(&hits), int32(1),
-		"waitReady must have probed the origin at least once")
-}
-
-// TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure guards the
-// bounded post-cancel teardown in Start: when waitReady fails, Start cancels
-// the daemon and must NOT block forever on its exit — mirroring ngrok's
-// bounded-teardown rationale, the teardown is capped by the independent
-// cloudflaredTeardownTimeout rather than the caller's context. waitReady can
-// fail (via its own internal readiness deadline or the daemon-exit check)
-// while the caller's context still has a long or infinite remaining lifetime,
-// so a ctx.Done()-based bound may never fire and Start would hang forever.
-func TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure(t *testing.T) {
+// TestCloudflaredStartReadyOnConnectedSignal locks the readiness contract:
+// Start must succeed — and mark the tunnel ready — once the cloudflared
+// CONNECTED signal fires (the connector's edge connection is established).
+// Readiness is deliberately NOT an HTTP probe of the public URL: that races
+// Cloudflare's edge, which answers with WAF/bot-mitigation 403s (Error 1020,
+// challenge pages via cf-mitigated) and routing errors (1016/1033/530) that
+// are not from the origin and would falsely report "ready".
+func TestCloudflaredStartReadyOnConnectedSignal(t *testing.T) {
 	// Provision a synthetic (non-real) tunnel state so Start passes the
 	// provisioning gate.
 	_ = redirectTunnelStatePath(t)
 	require.NoError(t, SaveCloudflareTunnelState(fixtureState()))
 
-	// Shrink the independent teardown cap so the test completes quickly; the
-	// cleanup restores the production value for other tests.
+	// Shrink the connect timeout: against a regression that never observes the
+	// signal, the test fails fast instead of hanging on the production cap.
+	origConnect := cloudflaredConnectTimeout
+	cloudflaredConnectTimeout = 2 * time.Second
+	t.Cleanup(func() { cloudflaredConnectTimeout = origConnect })
+
+	// Stub the embedded-daemon seam: on launch, notify the CONNECTED signal
+	// (the edge connection is up) and then keep running, like a real daemon.
+	origDaemon := startEmbeddedCloudflared
+	startEmbeddedCloudflared = func(_ context.Context, _ *CloudflareTunnelState, _ string, connected *signal.Signal) error {
+		connected.Notify()
+		<-make(chan struct{}) // block forever; simulate a live daemon (goroutine leaks by design)
+		return nil
+	}
+	t.Cleanup(func() { startEmbeddedCloudflared = origDaemon })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := &CloudflaredTunnel{}
+	require.NoError(t, c.Start(ctx, "127.0.0.1:8893"),
+		"Start must succeed once the cloudflared CONNECTED signal fires")
+
+	url, err := c.URL()
+	require.NoError(t, err, "the tunnel must be marked ready after the CONNECTED signal")
+	assert.Equal(t, "https://mcp.example.com", url)
+}
+
+// TestCloudflaredStartTimeoutWhenConnectedNeverFires guards BOTH the failure
+// gate and the bounded teardown: when the daemon never fires the CONNECTED
+// signal (and never exits), Start must return the connect-timeout error —
+// proving it no longer hangs on any readiness probe — and its post-failure
+// teardown must be bounded by the independent cloudflaredTeardownTimeout (not
+// the caller's context), even though the stubbed daemon ignores cancellation.
+func TestCloudflaredStartTimeoutWhenConnectedNeverFires(t *testing.T) {
+	// Provision a synthetic (non-real) tunnel state so Start passes the
+	// provisioning gate.
+	_ = redirectTunnelStatePath(t)
+	require.NoError(t, SaveCloudflareTunnelState(fixtureState()))
+
+	// Shrink both the connect timeout and the independent teardown cap so the
+	// test completes quickly; the cleanups restore the production values for
+	// other tests.
+	connectTimeout := 300 * time.Millisecond
+	origConnect := cloudflaredConnectTimeout
+	cloudflaredConnectTimeout = connectTimeout
+	t.Cleanup(func() { cloudflaredConnectTimeout = origConnect })
+
 	smallCap := 200 * time.Millisecond
 	origTeardown := cloudflaredTeardownTimeout
 	cloudflaredTeardownTimeout = smallCap
 	t.Cleanup(func() { cloudflaredTeardownTimeout = origTeardown })
 
-	// Stub the embedded-daemon seam with one that never observes
-	// cancellation: the daemon never exits, so only the independent cap
-	// (`time.After(cloudflaredTeardownTimeout)`) can unblock Start's
-	// teardown.
+	// Stub the embedded-daemon seam with one that NEVER fires the connected
+	// signal and NEVER exits: neither the readiness signal nor done can
+	// unblock Start, so only the connect timeout can fail the wait and only
+	// the independent cap can release the teardown.
 	entered := make(chan struct{})
 	origDaemon := startEmbeddedCloudflared
-	startEmbeddedCloudflared = func(context.Context, *CloudflareTunnelState, string) error {
+	startEmbeddedCloudflared = func(context.Context, *CloudflareTunnelState, string, *signal.Signal) error {
 		// The seam var has now been read by the daemon goroutine; signal so the
 		// cleanup never restores the package var ahead of that read (race-
 		// detector hygiene, the goroutine intentionally leaks).
@@ -163,19 +146,10 @@ func TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { startEmbeddedCloudflared = origDaemon })
 
-	// A quickly-cancelled caller context makes waitReady fail immediately via
-	// ctx.Err while the stuck daemon never closes done. Under the previous
-	// ctx.Done()-based teardown, the select's ctx case would fire ~instantly;
-	// the independent cap instead forces Start to honor the full
-	// cloudflaredTeardownTimeout before returning — proving the teardown
-	// bound no longer depends on the caller's ctx timing. (In production the
-	// regression scenario is broader: waitReady can fail via its own internal
-	// deadline or the daemon-exit check while the caller's context is still
-	// live, in which case a ctx.Done()-based bound would never fire and Start
-	// would block forever — the cap fixes exactly that, as this test's
-	// lower-bound assert fails against the pre-refinement code.)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	// A long-lived caller context: everything must be driven by the connect
+	// timeout and the teardown cap, never by ctx.Done().
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	c := &CloudflaredTunnel{}
 	started := time.Now()
@@ -192,16 +166,19 @@ func TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("daemon goroutine never invoked the stubbed seam")
 		}
-		// Start must surface the waitReady failure, not the teardown timing.
-		require.ErrorIs(t, r.err, context.Canceled)
-		// Teardown must have been released by the independent cap, not the
-		// (already-done) caller context: Start cannot return before the full
-		// cloudflaredTeardownTimeout has elapsed. Against the old
-		// ctx.Done()-based select this assert fails (Start returned almost
-		// immediately).
-		assert.GreaterOrEqual(t, time.Since(started), smallCap,
-			"teardown must be bounded by the independent cap, not the caller's ctx")
+		// Start must surface the connect timeout, not any other failure.
+		require.ErrorContains(t, r.err, "timed out waiting for cloudflared tunnel")
+		// The connect timeout must actually have been honored: Start cannot
+		// return before it elapses.
+		assert.GreaterOrEqual(t, time.Since(started), connectTimeout,
+			"readiness must wait for the CONNECTED signal (bounded by cloudflaredConnectTimeout), not return early")
+		// Bounded teardown: even though the daemon ignores cancellation, the
+		// total wait is capped at connectTimeout + cloudflaredTeardownTimeout
+		// (plus scheduling slack) — a daemon that never exits must not block
+		// Start beyond the independent cap.
+		assert.Less(t, time.Since(started), connectTimeout+smallCap+2*time.Second,
+			"post-failure teardown must be bounded by the independent cap even when the daemon never exits")
 	case <-time.After(15 * time.Second):
-		t.Fatal("Start blocked in post-cancel teardown: the independent cap was not honored")
+		t.Fatal("Start hung: neither the connect timeout nor the bounded teardown was honored")
 	}
 }

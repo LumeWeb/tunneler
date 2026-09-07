@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cloudflare/cloudflared/signal"
 
 	"go.lumeweb.com/tunneler"
 )
@@ -16,9 +17,15 @@ import (
 // cloudflaredTeardownTimeout bounds the post-cancel teardown wait in Start.
 // Mirroring the ngrok provider's timeout vars, it is an INDEPENDENT cap (not
 // the caller's context), so Start never blocks beyond it regardless of how
-// waitReady failed or how long the caller's context would otherwise run.
-// Package-level so tests can shrink it.
+// the readiness wait failed or how long the caller's context would otherwise
+// run. Package-level so tests can shrink it.
 var cloudflaredTeardownTimeout = 5 * time.Second
+
+// cloudflaredConnectTimeout bounds how long Start waits for the cloudflared
+// CONNECTED signal (the connector's edge connection being established) before
+// giving up. Mirroring the ngrok provider's timeout vars, it is a package-level
+// settable var so tests can shrink it.
+var cloudflaredConnectTimeout = 30 * time.Second
 
 // tunnelBase holds the shared bookkeeping for the tunnel implementations in
 // this package (mirrors the unexported core bookkeeping, which cannot be
@@ -76,7 +83,7 @@ type CloudflaredTunnel struct {
 	cancel context.CancelFunc
 	// done is closed by the single daemon goroutine when the embedded
 	// cloudflared has shut down. It is a broadcast exit signal: any number of
-	// readers (the readiness probe and Stop) can observe closure with a
+	// readers (the readiness wait and Stop) can observe closure with a
 	// non-blocking select.
 	done chan struct{}
 }
@@ -206,14 +213,18 @@ func (c *CloudflaredTunnel) Start(ctx context.Context, localAddr string) error {
 
 	done := make(chan struct{})
 	// The daemon runs detached from the caller's cancellation so the readiness
-	// probe below can observe it; Stop cancels this context to shut it down.
+	// wait below can observe it; Stop cancels this context to shut it down.
 	daemonCtx, cancel := context.WithCancel(ctx)
+	// The cloudflared CONNECTED signal fires when the connector has established
+	// its edge connection. The daemon goroutine passes it through to the
+	// embedded cloudflared runtime, which notifies it once connected.
+	connected := signal.New(make(chan struct{}))
 	go func() {
 		defer close(done)
-		if daemonErr := startEmbeddedCloudflared(daemonCtx, state, origin); daemonErr != nil && daemonCtx.Err() == nil {
+		if daemonErr := startEmbeddedCloudflared(daemonCtx, state, origin, connected); daemonErr != nil && daemonCtx.Err() == nil {
 			// The daemon failed on its own (not because we cancelled it).
 			// There is no error channel to the caller here; the readiness
-			// probe will observe the exit via done and report accordingly.
+			// wait below observes the exit via done and reports accordingly.
 			_ = daemonErr
 		}
 	}()
@@ -228,63 +239,38 @@ func (c *CloudflaredTunnel) Start(ctx context.Context, localAddr string) error {
 	// runtime restart converges on the exact hostname the tunnel was created for
 	// even if the caller-supplied domain differs from the provisioned state.
 	publicURL := "https://" + tunneler.BareHostname(state.Hostname)
-	if err := c.waitReady(ctx, publicURL); err != nil {
+	// Readiness is gated on the cloudflared CONNECTED signal, NOT an HTTP probe
+	// of the public URL: probing races Cloudflare's edge, which can answer with
+	// WAF/bot-mitigation 403s (Error 1020, challenge pages marked cf-mitigated)
+	// and edge routing errors (1016/1033/530) that are NOT responses from the
+	// origin — an HTTP status gate can misreport a not-yet-deliverable or
+	// blocked hostname as "ready". The CONNECTED signal is the connector's own
+	// deterministic report that the edge connection is established.
+	var readyErr error
+	select {
+	case <-connected.Wait():
+		// Edge connection established; leave the daemon running.
+	case <-done:
+		readyErr = fmt.Errorf("cloudflared exited before the tunnel became ready")
+	case <-ctx.Done():
+		readyErr = ctx.Err()
+	case <-time.After(cloudflaredConnectTimeout):
+		readyErr = fmt.Errorf("timed out waiting for cloudflared tunnel %s to become ready", publicURL)
+	}
+	if readyErr != nil {
 		cancel()
-		// Bounded teardown with an independent cap: waitReady can fail via its
-		// own internal readiness deadline or the daemon-exit check while the
-		// caller's context is still valid, so ctx.Done() may never fire. A
+		// Bounded teardown with an independent cap: readiness can fail while
+		// the caller's context is still valid, so ctx.Done() may never fire. A
 		// daemon that does not promptly observe cancellation must not block
 		// Start forever, so wait at most cloudflaredTeardownTimeout (not the
-		// caller's ctx) no matter how waitReady failed.
+		// caller's ctx) no matter how readiness failed.
 		select {
 		case <-done:
 		case <-time.After(cloudflaredTeardownTimeout):
 		}
-		return err
+		return readyErr
 	}
 	c.setReady(publicURL)
 	return nil
 }
 
-// waitReady polls the public URL until it responds over the tunnel, the
-// embedded cloudflared daemon exits (done closes), or the deadline expires.
-func (c *CloudflaredTunnel) waitReady(ctx context.Context, publicURL string) error {
-	deadline := time.Now().Add(30 * time.Second)
-	client := &http.Client{Timeout: 3 * time.Second}
-	for {
-		if c.exited() {
-			return fmt.Errorf("cloudflared exited before the tunnel became ready")
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for cloudflared tunnel %s to become ready", publicURL)
-		}
-		resp, err := client.Get(publicURL)
-		if err == nil {
-			code := resp.StatusCode
-			_ = resp.Body.Close()
-			// A response from the tunnel means we reached the edge; only edge/
-			// gateway-facing errors (5xx: Cloudflare 502/503/530, error
-			// pages emitted before the tunnel delivers to the origin) mean
-			// "not ready yet". A genuine 4xx (401/403/404) from the origin's
-			// probe path is passed through the tunnel, so it already proves
-			// the tunnel is delivering and counts as ready.
-			if code >= 200 && code < 500 {
-				return nil
-			}
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-}
-
-// exited reports whether the embedded cloudflared daemon has shut down.
-func (c *CloudflaredTunnel) exited() bool {
-	select {
-	case <-c.done:
-		return true
-	default:
-		return false
-	}
-}
