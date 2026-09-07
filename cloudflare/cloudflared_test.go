@@ -102,42 +102,57 @@ func TestWaitReadyRequiresSuccessStatus(t *testing.T) {
 
 // TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure guards the
 // bounded post-cancel teardown in Start: when waitReady fails, Start cancels
-// the daemon and must NOT block forever on its exit — a daemon that does not
-// promptly observe cancellation (mirroring ngrok's bounded-teardown rationale)
-// releases Start as soon as the caller's context is done.
+// the daemon and must NOT block forever on its exit — mirroring ngrok's
+// bounded-teardown rationale, the teardown is capped by the independent
+// cloudflaredTeardownTimeout rather than the caller's context. waitReady can
+// fail (via its own internal readiness deadline or the daemon-exit check)
+// while the caller's context still has a long or infinite remaining lifetime,
+// so a ctx.Done()-based bound may never fire and Start would hang forever.
 func TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure(t *testing.T) {
 	// Provision a synthetic (non-real) tunnel state so Start passes the
 	// provisioning gate.
 	_ = redirectTunnelStatePath(t)
 	require.NoError(t, SaveCloudflareTunnelState(fixtureState()))
 
+	// Shrink the independent teardown cap so the test completes quickly; the
+	// cleanup restores the production value for other tests.
+	smallCap := 200 * time.Millisecond
+	origTeardown := cloudflaredTeardownTimeout
+	cloudflaredTeardownTimeout = smallCap
+	t.Cleanup(func() { cloudflaredTeardownTimeout = origTeardown })
+
 	// Stub the embedded-daemon seam with one that never observes
-	// cancellation: the daemon never exits, so only the bounded select
-	// (ctx.Done()) can unblock Start's teardown.
+	// cancellation: the daemon never exits, so only the independent cap
+	// (`time.After(cloudflaredTeardownTimeout)`) can unblock Start's
+	// teardown.
 	entered := make(chan struct{})
 	origDaemon := startEmbeddedCloudflared
 	startEmbeddedCloudflared = func(context.Context, *CloudflareTunnelState, string) error {
 		// The seam var has now been read by the daemon goroutine; signal so the
-		// test never restores the stack var ahead of that read (race-detector
-		// hygiene, the goroutine intentionally leaks).
+		// cleanup never restores the package var ahead of that read (race-
+		// detector hygiene, the goroutine intentionally leaks).
 		close(entered)
 		<-make(chan struct{}) // block forever; simulate a stuck daemon
 		return nil
 	}
 	t.Cleanup(func() { startEmbeddedCloudflared = origDaemon })
 
-	// Use a reserved .invalid hostname so the readiness probe fails fast
-	// offline (DNS NXDOMAIN), deterministically driving waitReady to fail via
-	// the caller's deadline.
-	st, err := LoadCloudflareTunnelState()
-	require.NoError(t, err)
-	st.Hostname = "bounded-teardown.invalid"
-	require.NoError(t, SaveCloudflareTunnelState(st))
+	// A quickly-cancelled caller context makes waitReady fail immediately via
+	// ctx.Err while the stuck daemon never closes done. Under the previous
+	// ctx.Done()-based teardown, the select's ctx case would fire ~instantly;
+	// the independent cap instead forces Start to honor the full
+	// cloudflaredTeardownTimeout before returning — proving the teardown
+	// bound no longer depends on the caller's ctx timing. (In production the
+	// regression scenario is broader: waitReady can fail via its own internal
+	// deadline or the daemon-exit check while the caller's context is still
+	// live, in which case a ctx.Done()-based bound would never fire and Start
+	// would block forever — the cap fixes exactly that, as this test's
+	// lower-bound assert fails against the pre-refinement code.)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
 	c := &CloudflaredTunnel{}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
+	started := time.Now()
 	type startResult struct{ err error }
 	res := make(chan startResult, 1)
 	go func() { res <- startResult{c.Start(ctx, "127.0.0.1:8893")} }()
@@ -151,10 +166,16 @@ func TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("daemon goroutine never invoked the stubbed seam")
 		}
-		// Start must surface the waitReady failure; the bounded wait released
-		// it via ctx.Done() even though the daemon never exited.
-		require.ErrorIs(t, r.err, context.DeadlineExceeded)
+		// Start must surface the waitReady failure, not the teardown timing.
+		require.ErrorIs(t, r.err, context.Canceled)
+		// Teardown must have been released by the independent cap, not the
+		// (already-done) caller context: Start cannot return before the full
+		// cloudflaredTeardownTimeout has elapsed. Against the old
+		// ctx.Done()-based select this assert fails (Start returned almost
+		// immediately).
+		assert.GreaterOrEqual(t, time.Since(started), smallCap,
+			"teardown must be bounded by the independent cap, not the caller's ctx")
 	case <-time.After(15 * time.Second):
-		t.Fatal("Start blocked in post-cancel teardown: the bounded wait (ctx.Done) was not honored")
+		t.Fatal("Start blocked in post-cancel teardown: the independent cap was not honored")
 	}
 }

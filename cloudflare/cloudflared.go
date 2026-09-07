@@ -13,6 +13,13 @@ import (
 	"go.lumeweb.com/tunneler"
 )
 
+// cloudflaredTeardownTimeout bounds the post-cancel teardown wait in Start.
+// Mirroring the ngrok provider's timeout vars, it is an INDEPENDENT cap (not
+// the caller's context), so Start never blocks beyond it regardless of how
+// waitReady failed or how long the caller's context would otherwise run.
+// Package-level so tests can shrink it.
+var cloudflaredTeardownTimeout = 5 * time.Second
+
 // tunnelBase holds the shared bookkeeping for the tunnel implementations in
 // this package (mirrors the unexported core bookkeeping, which cannot be
 // embedded across packages).
@@ -223,13 +230,15 @@ func (c *CloudflaredTunnel) Start(ctx context.Context, localAddr string) error {
 	publicURL := "https://" + tunneler.BareHostname(state.Hostname)
 	if err := c.waitReady(ctx, publicURL); err != nil {
 		cancel()
-		// Bounded teardown, mirroring the ngrok provider: a daemon that does
-		// not promptly observe cancellation must not block Start forever, so
-		// wait at most until the caller's own deadline (already spent, since
-		// waitReady just failed) releases us.
+		// Bounded teardown with an independent cap: waitReady can fail via its
+		// own internal readiness deadline or the daemon-exit check while the
+		// caller's context is still valid, so ctx.Done() may never fire. A
+		// daemon that does not promptly observe cancellation must not block
+		// Start forever, so wait at most cloudflaredTeardownTimeout (not the
+		// caller's ctx) no matter how waitReady failed.
 		select {
 		case <-done:
-		case <-ctx.Done():
+		case <-time.After(cloudflaredTeardownTimeout):
 		}
 		return err
 	}
