@@ -89,10 +89,10 @@ func (b *baseTunnel) Start(_ context.Context, _ string) error {
 	return nil
 }
 
-func (b *baseTunnel) Stop(_ context.Context) error               { return nil }
-func (b *baseTunnel) SupportsCustomDomain() bool                 { return false }
-func (b *baseTunnel) RequiresToken() bool                        { return false }
-func (b *baseTunnel) MissingTokenError() error                    { return missingTokenError("base") }
+func (b *baseTunnel) Stop(_ context.Context) error { return nil }
+func (b *baseTunnel) SupportsCustomDomain() bool   { return false }
+func (b *baseTunnel) RequiresToken() bool          { return false }
+func (b *baseTunnel) MissingTokenError() error     { return missingTokenError("base") }
 func (b *baseTunnel) OAuthBaseURL(explicit, tunneled string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
