@@ -1,0 +1,14 @@
+include-auto-generated: true
+template: testify
+template-data:
+  unroll-variadic: true
+filename: "{{.InterfaceName}}.go"
+packages:
+  go.lumeweb.com/tunneler:
+    config:
+      dir: ./mocks
+      pkgname: mocks
+    interfaces:
+      AccountChecker: {}
+      Tunnel: {}
+      TunnelCredentialStore: {}

@@ -1,0 +1,27 @@
+[packages.tunneler]
+versioned_files = ["go.mod"]
+changelog = "CHANGELOG.md"
+scopes = ["tunneler"]
+
+[packages.ngrok]
+versioned_files = ["ngrok/go.mod"]
+changelog = "CHANGELOG.md"
+scopes = ["ngrok"]
+
+[packages.cloudflare]
+versioned_files = ["cloudflare/go.mod"]
+changelog = "CHANGELOG.md"
+scopes = ["cloudflare"]
+
+[github]
+owner = "LumeWeb"
+repo = "tunneler"
+
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows.steps]]
+type = "Release"
