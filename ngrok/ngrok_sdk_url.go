@@ -12,10 +12,12 @@ import (
 )
 
 // IsStableNgrokDevURL reports whether u is a stable ngrok dev-domain URL — the
-// account's persistent reserved dev domain (host ends in .ngrok-free.dev), as
-// opposed to the ephemeral *.ngrok-free.app subdomains a bare free-tier tunnel
-// is assigned, which rotate every session. Only the former is safe to persist
-// as a stable public URL.
+// account's persistent, auto-assigned dev domain (host ends in .ngrok-free.dev).
+// The ngrok service gives every free account exactly one dev domain and limits
+// free public endpoints to it (random URL generation is a paid-only feature),
+// so a bare free-tier forward IS deterministic and this URL is safe to persist.
+// The rotating-URL caveat applies to paid accounts, whose bare binds are
+// assigned ephemeral random hostnames that change every session.
 func IsStableNgrokDevURL(u string) bool {
 	if u == "" {
 		return false
@@ -42,7 +44,13 @@ var ResolveNgrokSDKURL = func(ctx context.Context, token string) (string, error)
 }
 
 // resolveNgrokSDKURLReal is the production implementation: open a temp ngrok
-// tunnel through the embedded agent and read its assigned URL.
+// tunnel through the embedded agent and read its assigned URL. The SDK agent
+// sends its http/https bind WITHOUT a hostname when no WithURL option is given
+// (the empty-URL branch in the SDK's endpoint option handling), so the ngrok
+// service chooses the URL; on a free account its only permitted public
+// endpoint base is the account's auto-assigned dev domain. Paid accounts are
+// instead given ephemeral random URLs per session, so the returned URL must be
+// treated as stable only for free-tier authtokens (see IsStableNgrokDevURL).
 func resolveNgrokSDKURLReal(ctx context.Context, token string) (string, error) {
 	agentOpts := []ngrok.AgentOption{}
 	if token != "" {
