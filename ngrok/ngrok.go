@@ -215,6 +215,11 @@ var ngrokConnectTimeout = 30 * time.Second
 // the window.
 var ngrokLoginProbeTimeout = 5 * time.Second
 
+// ngrokWaitReadyTimeout bounds how long waitReady polls the freshly assigned
+// public URL for it to start accepting traffic before Start gives up. It is a
+// package-level var (not const) so tests can shrink the window.
+var ngrokWaitReadyTimeout = 30 * time.Second
+
 // connectBounded establishes the agent's control-plane session with a deadline
 // that applies ONLY while connecting. ngrok's reconnecting session retries a
 // failed connect (e.g. a bad authtoken) forever with no deadline and ignores
@@ -457,6 +462,13 @@ func (n *ngrokTunnel) Start(ctx context.Context, localAddr string) error {
 		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = n.Stop(shCtx)
+		// Stop cancelled the control-plane session; clear the cached agent so a
+		// retry rebuilds a live agent+session instead of failing on the dead one.
+		n.mu.Lock()
+		n.agent = nil
+		n.stopSession = nil
+		n.stop = nil
+		n.mu.Unlock()
 		return err
 	}
 	n.setReady(fwd.URL().String())
@@ -466,7 +478,7 @@ func (n *ngrokTunnel) Start(ctx context.Context, localAddr string) error {
 // waitReady polls the public URL until it responds over the tunnel, the
 // forwarder exits, or the context/deadline expires.
 func (n *ngrokTunnel) waitReady(ctx context.Context, publicURL string) error {
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(ngrokWaitReadyTimeout)
 	client := &http.Client{Timeout: 3 * time.Second}
 	for {
 		n.mu.Lock()

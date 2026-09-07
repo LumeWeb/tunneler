@@ -172,16 +172,23 @@ func TestNgrokCheckAccountFailsFast(t *testing.T) {
 
 // fakeNgrokForwarder is a minimal ngrok.EndpointForwarder for tests. It embeds
 // the interface so every method is satisfied with zero boilerplate, overriding
-// only URL (used by Start/setReady) and Done (used by waitReady). Calling any
-// other method would panic, but the production code path exercised by these
-// tests only touches URL and Done.
+// only URL (used by Start/setReady), Done (used by waitReady), and
+// CloseWithContext (used by Stop, which the waitReady-failure teardown calls).
+// Calling any other method would panic, but the production code path exercised
+// by these tests only touches those three.
 type fakeNgrokForwarder struct {
 	ngrokSDK.EndpointForwarder
-	u    *url.URL
-	done chan struct{}
+	u      *url.URL
+	done   chan struct{}
+	closed int
 }
 
 func (f *fakeNgrokForwarder) URL() *url.URL { return f.u }
+
+func (f *fakeNgrokForwarder) CloseWithContext(context.Context) error {
+	f.closed++
+	return nil
+}
 
 func (f *fakeNgrokForwarder) Done() <-chan struct{} {
 	if f.done == nil {
@@ -326,6 +333,64 @@ func TestNgrokForwardFailureClearsCachedAgent(t *testing.T) {
 	ready, gotURL := ng.getState()
 	require.True(t, ready, "the successful retry must mark the tunnel ready")
 	require.Equal(t, "https://mcp.example.com", gotURL)
+}
+
+// TestNgrokWaitReadyFailureClearsCachedAgent is the regression test for the
+// retry-after-readiness-failure failure. When waitReady timed out inside Start
+// (free-tier path: the assigned public URL never accepted traffic), the
+// teardown called Stop — which cancelled the session context — but left the
+// cached n.agent, n.stopSession, and n.stop fields populated, exactly like the
+// Forward-failure case. A retry's connectedAgent then short-circuited on the
+// cached, now-dead agent and agent.Forward deterministically failed with
+// "session closed" instead of rebuilding a live agent and session.
+//
+// The fix clears the cached fields after the Stop teardown, mirroring the
+// Forward-failure branch. The factory counts builds; the fake forwarder's URL
+// points at a dead local address so waitReady's public-URL probe (against a
+// shrunk ngrokWaitReadyTimeout) times out and drives the failure path.
+func TestNgrokWaitReadyFailureClearsCachedAgent(t *testing.T) {
+	oldWait := ngrokWaitReadyTimeout
+	ngrokWaitReadyTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { ngrokWaitReadyTimeout = oldWait })
+
+	builds := 0
+	ng := &ngrokTunnel{
+		token: "test-token",
+		agentFactory: func(...ngrokSDK.AgentOption) (ngrokSDK.Agent, error) {
+			builds++
+			return &fakeNgrokAgent{
+				fwd: &fakeNgrokForwarder{u: &url.URL{Scheme: "http", Host: "127.0.0.1:1"}},
+			}, nil
+		},
+	}
+
+	// No custom domain: Start takes the free-tier branch and waits for the
+	// provider-assigned URL to accept traffic. The fake forwarder's URL points
+	// at a non-responding local address, so waitReady must time out and Start
+	// must surface the failure.
+	err := ng.Start(context.Background(), "127.0.0.1:8893")
+	require.Error(t, err, "Start must fail when the assigned URL never accepts traffic")
+	require.Contains(t, err.Error(), "timed out waiting for ngrok tunnel",
+		"the failure must come from the waitReady readiness window")
+	require.Equal(t, 1, builds, "the failed attempt must have built exactly one agent")
+
+	// The failure must reset the cached agent and session teardown hooks: Stop
+	// cancelled the session context, so the cached agent is dead. Pre-fix
+	// (before the waitReady-failure branch cleared them) these fields stayed
+	// non-nil and a retry reused the dead agent.
+	ng.mu.Lock()
+	require.Nil(t, ng.agent, "agent cache must be cleared after a readiness failure")
+	require.Nil(t, ng.stopSession, "session teardown hook must be cleared after a readiness failure")
+	require.Nil(t, ng.stop, "forward-cancel hook must be cleared after a readiness failure")
+	require.False(t, ng.ready, "a failed Start must not mark the tunnel ready")
+	ng.mu.Unlock()
+
+	// A retry must rebuild a fresh agent rather than short-circuit on the
+	// cached (dead) one. The retry goes through the same dead-URL readiness
+	// window and fails again — the assertion here is on the rebuild, proving
+	// the retry did not get stuck on the stale agent.
+	require.Error(t, ng.Start(context.Background(), "127.0.0.1:8893"))
+	require.Equal(t, 2, builds, "a retry after a readiness failure must build a fresh agent")
 }
 
 // TestNgrokStartKeepsSessionAliveAfterConnect is the regression test for the
