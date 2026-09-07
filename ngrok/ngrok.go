@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	ngrok "golang.ngrok.com/ngrok/v2"
 	"go.uber.org/zap"
+	ngrok "golang.ngrok.com/ngrok/v2"
 
 	"go.lumeweb.com/tunneler"
 )
@@ -62,7 +62,7 @@ var errUnavailable = tunneler.ErrNotReady
 
 // ngrokTunnel serves a locally bound HTTP server through a tunnel powered by
 // the ngrok Go SDK, embedded in this process (no `ngrok` agent subprocess). It
-// supports the free tier (a provider-assigned *.ngrok-free.app dev domain) and
+// supports the free tier (the account's stable *.ngrok-free.dev dev domain) and
 // custom domains on paid accounts (--url https://<domain>).
 //
 // The tunnel runs inside the agent built by ngrok.NewAgent, which itself reads
@@ -413,8 +413,18 @@ func (n *ngrokTunnel) Start(ctx context.Context, localAddr string) error {
 		// Forward failed, so the established control-plane session is never
 		// reused and Stop() would early-return on fwd==nil without releasing
 		// it. Tear the session down here to avoid leaking it.
+		//
+		// Also reset the cached agent/session bookkeeping under the lock: the
+		// session context is about to be cancelled, so the cached agent is dead
+		// (a retry's agent.Forward would deterministically fail with "session
+		// closed"). Clearing n.agent/n.stopSession/n.stop makes a subsequent
+		// connectedAgent build a fresh, live agent and session instead of
+		// short-circuiting on the cached one.
 		n.mu.Lock()
 		ss := n.stopSession
+		n.stopSession = nil
+		n.agent = nil
+		n.stop = nil
 		n.mu.Unlock()
 		if ss != nil {
 			ss()

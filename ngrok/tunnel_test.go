@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	ngrokSDK "golang.ngrok.com/ngrok/v2"
 	"github.com/stretchr/testify/require"
+	ngrokSDK "golang.ngrok.com/ngrok/v2"
 )
 
 func TestRequiresToken(t *testing.T) {
@@ -271,6 +271,61 @@ func TestNgrokCheckAccountDoesNotPoisonStartSession(t *testing.T) {
 	require.NotNil(t, probe.connectCtx, "probe agent must have received a connect context")
 	require.NotNil(t, startAgent.connectCtx, "start agent must have received a connect context")
 	require.NotEqual(t, probe.connectCtx, startAgent.connectCtx, "probe and start sessions must use independent contexts")
+}
+
+// TestNgrokForwardFailureClearsCachedAgent is the regression test for the
+// retry-after-Forward-failure failure. When agent.Forward failed inside Start,
+// the teardown cancelled the session context but left the cached n.agent,
+// n.stopSession, and n.stop fields populated — so connectedAgent returned the
+// cached, now-dead agent on the next Start, and the retry deterministically
+// failed with "session closed" instead of rebuilding a live agent and session.
+//
+// The fix clears the cached fields while tearing the session down, so a failed
+// Start leaves the tunnel cleanly unstarted and a retry builds a fresh agent.
+// The factory counts builds; a forwardErr that flips off after the first
+// failure lets the test assert both the field reset and that the retry uses a
+// newly built agent.
+func TestNgrokForwardFailureClearsCachedAgent(t *testing.T) {
+	forwardErr := errors.New("transient forward failure")
+	fail := true
+	builds := 0
+	ng := &ngrokTunnel{
+		domain: "mcp.example.com",
+		token:  "test-token",
+		agentFactory: func(...ngrokSDK.AgentOption) (ngrokSDK.Agent, error) {
+			builds++
+			return &fakeNgrokAgent{forwardErr: func() error {
+				if fail {
+					return forwardErr
+				}
+				return nil
+			}(), fwd: &fakeNgrokForwarder{u: &url.URL{Scheme: "https", Host: "mcp.example.com"}}}, nil
+		},
+	}
+
+	// First Start: connect succeeds but Forward fails transiently.
+	err := ng.Start(context.Background(), "127.0.0.1:8893")
+	require.ErrorIs(t, err, forwardErr, "Start must surface the Forward failure")
+	require.Equal(t, 1, builds, "the failed attempt must have built exactly one agent")
+
+	// The failure must reset the cached agent and session teardown hooks: the
+	// session context was cancelled, so the cached agent is dead. Pre-fix these
+	// fields stayed non-nil and a retry reused the dead agent.
+	ng.mu.Lock()
+	require.Nil(t, ng.agent, "agent cache must be cleared after a Forward failure")
+	require.Nil(t, ng.stopSession, "session teardown hook must be cleared after a Forward failure")
+	require.Nil(t, ng.stop, "forward-cancel hook must be cleared after a Forward failure")
+	require.False(t, ng.ready, "a failed Start must not mark the tunnel ready")
+	ng.mu.Unlock()
+
+	// A retry must rebuild a fresh agent rather than short-circuit on the
+	// cached (dead) one, and succeed now that the transient error is gone.
+	fail = false
+	require.NoError(t, ng.Start(context.Background(), "127.0.0.1:8893"))
+	require.Equal(t, 2, builds, "a retry after a Forward failure must build a fresh agent")
+	ready, gotURL := ng.getState()
+	require.True(t, ready, "the successful retry must mark the tunnel ready")
+	require.Equal(t, "https://mcp.example.com", gotURL)
 }
 
 // TestNgrokStartKeepsSessionAliveAfterConnect is the regression test for the
