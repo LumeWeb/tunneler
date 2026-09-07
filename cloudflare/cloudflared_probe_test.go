@@ -191,3 +191,43 @@ func TestIsGenuineOriginResponse(t *testing.T) {
 		})
 	}
 }
+
+// TestProbeOriginReadyHonorsBudgetWhenServerStalls is a regression test for a
+// startup hang in the readiness probe: the probe's loop only checked its
+// deadline AFTER the HTTP request returned, and the request used the default
+// http.Get client (which has NO timeout) — so a single hung/TLS-stalled
+// origin request blocked the probe loop forever, parking Start past
+// cloudflaredProbeTimeout and out of reach of caller-ctx cancellation.
+//
+// The probe is exercised for real (NOT stubbed) against an httptest server
+// whose handler stalls and never responds; the test asserts the probe returns
+// (false) within a watchdog of 3s for a 200ms budget. Against the old
+// unbounded http.Get code this test hangs and fails via the watchdog.
+func TestProbeOriginReadyHonorsBudgetWhenServerStalls(t *testing.T) {
+	// A server whose handler never responds: every request stalls open.
+	stall := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		<-stall
+	}))
+	// Cleanup order matters (LIFO): unblock the stalled handler BEFORE the
+	// server closes, so Close's wait for connection EOF cannot block.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(stall) })
+
+	probeBudget := 200 * time.Millisecond
+	started := time.Now()
+	done := make(chan bool, 1)
+	go func() {
+		// Exercise the REAL probe closure: no stubbing, real network path.
+		done <- probeOriginReady(srv.URL, probeBudget)
+	}()
+
+	select {
+	case ok := <-done:
+		assert.False(t, ok, "a stalled server must not be reported as ready")
+		assert.Less(t, time.Since(started), 3*time.Second,
+			"the probe must honor its budget on every attempt, not block on a stalled request")
+	case <-time.After(3 * time.Second):
+		t.Fatal("probeOriginReady hung past its budget (stalled request blocked the loop)")
+	}
+}

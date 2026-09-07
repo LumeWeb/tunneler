@@ -78,14 +78,31 @@ func isGenuineOriginResponse(resp *http.Response) bool {
 // package-level var so tests can stub the network interaction entirely.
 var probeOriginReady = func(publicURL string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
+	// Per-attempt client timeout: the default http.Get has none, so a single
+	// hung/TLS-stalled request must not be able to block the probe past its
+	// budget. Bounding each attempt by the remaining budget also lets a stalled
+	// request return (and Start resume) as soon as the deadline is exhausted.
+	client := &http.Client{Timeout: 2 * time.Second}
 	for {
-		resp, err := http.Get(publicURL)
-		if err == nil {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicURL, nil)
+		if err != nil {
+			cancel()
+			return false
+		}
+		resp, doErr := client.Do(req)
+		if doErr == nil {
 			_ = resp.Body.Close()
 			if isGenuineOriginResponse(resp) {
+				cancel()
 				return true
 			}
 		}
+		cancel()
 		// Stop if the bounded budget is exhausted (or the retry interval were
 		// to overshoot it).
 		now := time.Now()
