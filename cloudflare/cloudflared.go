@@ -254,8 +254,12 @@ func (c *CloudflaredTunnel) waitReady(ctx context.Context, publicURL string) err
 		}
 		resp, err := client.Get(publicURL)
 		if err == nil {
+			code := resp.StatusCode
 			_ = resp.Body.Close()
-			if resp.StatusCode > 0 {
+			// Only a success (2xx/3xx) response means the tunnel is delivering
+			// to the origin; gateway error pages (502/503/530) must not count
+			// as ready.
+			if code >= 200 && code < 400 {
 				return nil
 			}
 		}

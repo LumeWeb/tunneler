@@ -2,7 +2,10 @@ package cloudflare
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,6 +69,35 @@ func TestMissingTokenError(t *testing.T) {
 	cf := &CloudflaredTunnel{statePath: filepath.Join(t.TempDir(), "missing.json"), name: "t"}
 	require.True(t, cf.RequiresToken(), "unprovisioned cloudflared tunnel requires setup")
 	require.ErrorContains(t, cf.MissingTokenError(), "cloudflared tunnel is not provisioned")
+}
+
+// TestWaitReadyRequiresSuccessStatus guards the readiness semantics: only a
+// 2xx/3xx response over the tunnel counts as ready. Cloudflare fronts an
+// unreachable origin with gateway error pages (502/503/530), so waitReady must
+// keep polling through those instead of treating the first response (any
+// status) as success.
+func TestWaitReadyRequiresSuccessStatus(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Answer with 503 gateway error pages for the first three probes; only
+		// then does the tunnel "deliver to the origin" (200).
+		if atomic.AddInt32(&hits, 1) <= 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := &CloudflaredTunnel{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, c.waitReady(ctx, srv.URL), "waitReady must return once the tunnel serves a success response")
+	// Against the old StatusCode > 0 logic waitReady returned on the very
+	// first probe (single hit); polling through the 503s proves the fix.
+	assert.GreaterOrEqual(t, atomic.LoadInt32(&hits), int32(4),
+		"waitReady must keep polling through 503 gateway error pages, not return on the first response")
 }
 
 // TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure guards the
