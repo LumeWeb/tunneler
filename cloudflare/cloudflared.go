@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -26,6 +27,78 @@ var cloudflaredTeardownTimeout = 5 * time.Second
 // giving up. Mirroring the ngrok provider's timeout vars, it is a package-level
 // settable var so tests can shrink it.
 var cloudflaredConnectTimeout = 30 * time.Second
+
+// cloudflaredProbeTimeout bounds the post-connected deliverability probe: how
+// long the readiness probe of the public URL may keep retrying (after the
+// CONNECTED signal) to observe a genuine origin response before concluding the
+// hostname is not delivering (e.g. DNS route missing, origin unreachable).
+// Package-level so tests can shrink it.
+var cloudflaredProbeTimeout = 10 * time.Second
+
+// isGenuineOriginResponse classifies whether an HTTP response plausibly came
+// from the origin application (i.e. the tunnel is actually delivering traffic)
+// rather than being a Cloudflare edge artifact. It is pure over the response
+// headers/status so it is trivially unit-testable.
+//
+// Rationale (Cloudflare-documented headers):
+//   - Edge WAF/bot-mitigation blocks (Error 1020) and challenge pages carry
+//     `cf-mitigated: challenge` at the edge — these are Cloudflare answering
+//     INSTEAD of the origin, so a forbidden status is not evidence the origin
+//     responded.
+//   - Edge-generated routing/error pages (1016 origin DNS error, 1033 argo
+//     tunnel error, and the 502-530 family) carry `cf-error-type` /
+//     `cf-error-origin` headers; their presence means Cloudflare's edge, not
+//     the origin, produced the response.
+//
+// A 2xx-4xx status WITHOUT those edge headers is treated as a genuine origin
+// response: the request reached the local origin and it answered (4xx semantics
+// belong to the origin application). A 5xx — with or without edge headers — is
+// not "ready": it is either an edge error page (always edge-header-marked in
+// that family) or an origin failure, and neither proves deliverability.
+func isGenuineOriginResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
+		return false
+	}
+	if resp.Header.Get("Cf-Mitigated") == "challenge" {
+		return false
+	}
+	if resp.Header.Get("Cf-Error-Type") != "" || resp.Header.Get("Cf-Error-Origin") != "" {
+		return false
+	}
+	return true
+}
+
+// probeOriginReady performs ONE bounded, edge-aware probe of the public URL:
+// until timeout it GETs the URL (roughly every 300ms) and returns true as soon
+// as a genuine origin response is observed; connection errors, Cloudflare edge
+// pages, 5xx responses, and timeout expiry all return false. It is a
+// package-level var so tests can stub the network interaction entirely.
+var probeOriginReady = func(publicURL string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		resp, err := http.Get(publicURL)
+		if err == nil {
+			_ = resp.Body.Close()
+			if isGenuineOriginResponse(resp) {
+				return true
+			}
+		}
+		// Stop if the bounded budget is exhausted (or the retry interval were
+		// to overshoot it).
+		now := time.Now()
+		if !now.Add(cloudflareProbeRetryInterval).Before(deadline) {
+			return false
+		}
+		time.Sleep(cloudflareProbeRetryInterval)
+	}
+}
+
+// cloudflareProbeRetryInterval is the pacing between probe attempts inside
+// probeOriginReady.
+const cloudflareProbeRetryInterval = 300 * time.Millisecond
 
 // tunnelBase holds the shared bookkeeping for the tunnel implementations in
 // this package (mirrors the unexported core bookkeeping, which cannot be
@@ -239,17 +312,30 @@ func (c *CloudflaredTunnel) Start(ctx context.Context, localAddr string) error {
 	// runtime restart converges on the exact hostname the tunnel was created for
 	// even if the caller-supplied domain differs from the provisioned state.
 	publicURL := "https://" + tunneler.BareHostname(state.Hostname)
-	// Readiness is gated on the cloudflared CONNECTED signal, NOT an HTTP probe
-	// of the public URL: probing races Cloudflare's edge, which can answer with
-	// WAF/bot-mitigation 403s (Error 1020, challenge pages marked cf-mitigated)
-	// and edge routing errors (1016/1033/530) that are NOT responses from the
-	// origin — an HTTP status gate can misreport a not-yet-deliverable or
-	// blocked hostname as "ready". The CONNECTED signal is the connector's own
-	// deterministic report that the edge connection is established.
+	// Readiness is a HYBRID of the cloudflared CONNECTED signal plus a bounded,
+	// edge-aware HTTP probe of the public URL:
+	//   1. The CONNECTED signal is the connector's own deterministic report that
+	//      the edge connection is established — so does not race the connector's
+	//      startup the way a naive immediate probe would.
+	//   2. But a connected edge does not guarantee the public hostname DELIVERS
+	//      traffic: the DNS/CNAME route may be missing (1016) or the origin
+	//      unreachable. So after the signal, a bounded probe of the public URL
+	//      must confirm a GENUINE ORIGIN response before reporting ready: the
+	//      probe's classifier excludes Cloudflare edge artifacts (WAF/bot 403s
+	//      carrying cf-mitigated: challenge, and edge error pages carrying
+	//      cf-error-type/cf-error-origin) so a WAF-blocked or not-yet-routed
+	//      hostname is never falsely reported ready, while still restoring
+	//      end-to-end deliverability verification.
 	var readyErr error
 	select {
 	case <-connected.Wait():
-		// Edge connection established; leave the daemon running.
+		// Edge connection is up, but the public hostname may not deliver yet
+		// (DNS/CNAME route missing, origin unreachable). Verify with a bounded,
+		// edge-aware probe so Cloudflare WAF/challenge/routing pages aren't
+		// mistaken for an origin response.
+		if !probeOriginReady(publicURL, cloudflaredProbeTimeout) {
+			readyErr = fmt.Errorf("cloudflared tunnel %s did not become reachable", publicURL)
+		}
 	case <-done:
 		readyErr = fmt.Errorf("cloudflared exited before the tunnel became ready")
 	case <-ctx.Done():
@@ -273,4 +359,3 @@ func (c *CloudflaredTunnel) Start(ctx context.Context, localAddr string) error {
 	c.setReady(publicURL)
 	return nil
 }
-

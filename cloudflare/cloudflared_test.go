@@ -66,11 +66,13 @@ func TestMissingTokenError(t *testing.T) {
 
 // TestCloudflaredStartReadyOnConnectedSignal locks the readiness contract:
 // Start must succeed — and mark the tunnel ready — once the cloudflared
-// CONNECTED signal fires (the connector's edge connection is established).
-// Readiness is deliberately NOT an HTTP probe of the public URL: that races
-// Cloudflare's edge, which answers with WAF/bot-mitigation 403s (Error 1020,
-// challenge pages via cf-mitigated) and routing errors (1016/1033/530) that
-// are not from the origin and would falsely report "ready".
+// CONNECTED signal fires (the connector's edge connection is established) AND
+// the post-connected deliverability probe confirms a genuine origin response.
+// Readiness is a HYBRID: the deterministic connected signal establishes the
+// edge connection without racing the connector's startup, then a bounded,
+// edge-aware probe of the public URL verifies the hostname actually delivers
+// (the probe's classifier excludes Cloudflare WAF/challenge/routing pages, so
+// they are never mistaken for an origin response).
 func TestCloudflaredStartReadyOnConnectedSignal(t *testing.T) {
 	// Provision a synthetic (non-real) tunnel state so Start passes the
 	// provisioning gate.
@@ -82,6 +84,18 @@ func TestCloudflaredStartReadyOnConnectedSignal(t *testing.T) {
 	origConnect := cloudflaredConnectTimeout
 	cloudflaredConnectTimeout = 2 * time.Second
 	t.Cleanup(func() { cloudflaredConnectTimeout = origConnect })
+
+	// Stub the probe seam: the edge-aware deliverability probe succeeds (its
+	// network behavior is the real network's problem, not this test's).
+	origProbe := probeOriginReady
+	probeURL := ""
+	probeTimeout := time.Duration(0)
+	probeOriginReady = func(publicURL string, timeout time.Duration) bool {
+		probeURL = publicURL
+		probeTimeout = timeout
+		return true
+	}
+	t.Cleanup(func() { probeOriginReady = origProbe })
 
 	// Stub the embedded-daemon seam: on launch, notify the CONNECTED signal
 	// (the edge connection is up) and then keep running, like a real daemon.
@@ -103,6 +117,11 @@ func TestCloudflaredStartReadyOnConnectedSignal(t *testing.T) {
 	url, err := c.URL()
 	require.NoError(t, err, "the tunnel must be marked ready after the CONNECTED signal")
 	assert.Equal(t, "https://mcp.example.com", url)
+
+	// The hybrid's second stage must actually have run: the probe received the
+	// public URL derived from the provisioned state and the probe budget.
+	assert.Equal(t, "https://mcp.example.com", probeURL, "the deliverability probe must target the public URL")
+	assert.Equal(t, cloudflaredProbeTimeout, probeTimeout, "the deliverability probe must run with the package budget")
 }
 
 // TestCloudflaredStartTimeoutWhenConnectedNeverFires guards BOTH the failure
