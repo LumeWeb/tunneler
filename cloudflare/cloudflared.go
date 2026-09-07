@@ -265,10 +265,13 @@ func (c *CloudflaredTunnel) waitReady(ctx context.Context, publicURL string) err
 		if err == nil {
 			code := resp.StatusCode
 			_ = resp.Body.Close()
-			// Only a success (2xx/3xx) response means the tunnel is delivering
-			// to the origin; gateway error pages (502/503/530) must not count
-			// as ready.
-			if code >= 200 && code < 400 {
+			// A response from the tunnel means we reached the edge; only edge/
+			// gateway-facing errors (5xx: Cloudflare 502/503/530, error
+			// pages emitted before the tunnel delivers to the origin) mean
+			// "not ready yet". A genuine 4xx (401/403/404) from the origin's
+			// probe path is passed through the tunnel, so it already proves
+			// the tunnel is delivering and counts as ready.
+			if code >= 200 && code < 500 {
 				return nil
 			}
 		}

@@ -72,10 +72,11 @@ func TestMissingTokenError(t *testing.T) {
 }
 
 // TestWaitReadyRequiresSuccessStatus guards the readiness semantics: only a
-// 2xx/3xx response over the tunnel counts as ready. Cloudflare fronts an
-// unreachable origin with gateway error pages (502/503/530), so waitReady must
-// keep polling through those instead of treating the first response (any
-// status) as success.
+// genuine origin response (2xx-4xx) over the tunnel counts as ready; edge/
+// gateway-facing errors (5xx error pages like Cloudflare's 502/503/530, emitted
+// before the tunnel delivers to the origin) must not. waitReady must keep
+// polling through those instead of treating the first response (any status) as
+// ready.
 func TestWaitReadyRequiresSuccessStatus(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -98,6 +99,31 @@ func TestWaitReadyRequiresSuccessStatus(t *testing.T) {
 	// first probe (single hit); polling through the 503s proves the fix.
 	assert.GreaterOrEqual(t, atomic.LoadInt32(&hits), int32(4),
 		"waitReady must keep polling through 503 gateway error pages, not return on the first response")
+}
+
+// TestWaitReadyAcceptsOrigin4xx locks the cloudflare-specific readiness
+// semantics: named tunnels pass the ORIGIN's real status through the tunnel,
+// so a genuine 4xx (401/403/404) returned by the origin's probe path already
+// proves the tunnel is delivering to the origin. Only 5xx edge/gateway errors
+// mean "not ready yet". Under the previous 2xx/3xx-only gate (code < 400)
+// waitReady would have polled until its deadline and failed, so this test
+// fails against the pre-refinement code.
+func TestWaitReadyAcceptsOrigin4xx(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := &CloudflaredTunnel{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, c.waitReady(ctx, srv.URL),
+		"waitReady must treat a genuine origin 4xx as ready — the tunnel is already delivering the origin's response")
+	assert.GreaterOrEqual(t, atomic.LoadInt32(&hits), int32(1),
+		"waitReady must have probed the origin at least once")
 }
 
 // TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure guards the
