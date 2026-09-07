@@ -3,7 +3,6 @@ package tunneler
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,18 +106,6 @@ var errUnavailable = ErrNotReady
 // application's flags/env, the provider's config file, or its installer.
 func missingTokenError(name string) error {
 	return fmt.Errorf("%s tunnel requires an account token: pass --token or set the provider token (see --help)", name)
-}
-
-// waitCtx waits for a command to exit, honoring ctx cancellation.
-func waitCtx(ctx context.Context, cmd *exec.Cmd) error {
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // SplitHostPort splits a "host:port" address into its parts.
