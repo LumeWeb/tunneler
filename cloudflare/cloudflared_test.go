@@ -67,3 +67,62 @@ func TestMissingTokenError(t *testing.T) {
 	require.True(t, cf.RequiresToken(), "unprovisioned cloudflared tunnel requires setup")
 	require.ErrorContains(t, cf.MissingTokenError(), "cloudflared tunnel is not provisioned")
 }
+
+// TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure guards the
+// bounded post-cancel teardown in Start: when waitReady fails, Start cancels
+// the daemon and must NOT block forever on its exit — a daemon that does not
+// promptly observe cancellation (mirroring ngrok's bounded-teardown rationale)
+// releases Start as soon as the caller's context is done.
+func TestCloudflaredStartBoundedTeardownAfterWaitReadyFailure(t *testing.T) {
+	// Provision a synthetic (non-real) tunnel state so Start passes the
+	// provisioning gate.
+	_ = redirectTunnelStatePath(t)
+	require.NoError(t, SaveCloudflareTunnelState(fixtureState()))
+
+	// Stub the embedded-daemon seam with one that never observes
+	// cancellation: the daemon never exits, so only the bounded select
+	// (ctx.Done()) can unblock Start's teardown.
+	entered := make(chan struct{})
+	origDaemon := startEmbeddedCloudflared
+	startEmbeddedCloudflared = func(context.Context, *CloudflareTunnelState, string) error {
+		// The seam var has now been read by the daemon goroutine; signal so the
+		// test never restores the stack var ahead of that read (race-detector
+		// hygiene, the goroutine intentionally leaks).
+		close(entered)
+		<-make(chan struct{}) // block forever; simulate a stuck daemon
+		return nil
+	}
+	t.Cleanup(func() { startEmbeddedCloudflared = origDaemon })
+
+	// Use a reserved .invalid hostname so the readiness probe fails fast
+	// offline (DNS NXDOMAIN), deterministically driving waitReady to fail via
+	// the caller's deadline.
+	st, err := LoadCloudflareTunnelState()
+	require.NoError(t, err)
+	st.Hostname = "bounded-teardown.invalid"
+	require.NoError(t, SaveCloudflareTunnelState(st))
+
+	c := &CloudflaredTunnel{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	type startResult struct{ err error }
+	res := make(chan startResult, 1)
+	go func() { res <- startResult{c.Start(ctx, "127.0.0.1:8893")} }()
+
+	select {
+	case r := <-res:
+		// Ensure the daemon goroutine actually dispatched through the stubbed
+		// seam before cleanup restores it.
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("daemon goroutine never invoked the stubbed seam")
+		}
+		// Start must surface the waitReady failure; the bounded wait released
+		// it via ctx.Done() even though the daemon never exited.
+		require.ErrorIs(t, r.err, context.DeadlineExceeded)
+	case <-time.After(15 * time.Second):
+		t.Fatal("Start blocked in post-cancel teardown: the bounded wait (ctx.Done) was not honored")
+	}
+}

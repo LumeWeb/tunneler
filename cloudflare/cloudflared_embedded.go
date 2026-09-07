@@ -96,10 +96,18 @@ func buildCloudflaredIngress(hostname, origin string) (ingress.Ingress, error) {
 	})
 }
 
-// startEmbeddedCloudflared builds and launches an in-process cloudflared NAMED
+// startEmbeddedCloudflared is the seam used to launch the embedded daemon
+// path. Production invokes the full launch below; tests redirect it to
+// simulate daemons (e.g. one that ignores cancellation) without constructing
+// the cloudflared runtime.
+var startEmbeddedCloudflared = func(ctx context.Context, state *CloudflareTunnelState, origin string) error {
+	return launchEmbeddedCloudflared(ctx, state, origin)
+}
+
+// launchEmbeddedCloudflared builds and launches an in-process cloudflared NAMED
 // tunnel that routes state.Hostname to the given local origin. It blocks until
 // the daemon exits (on ctx cancellation or its own failure).
-func startEmbeddedCloudflared(ctx context.Context, state *CloudflareTunnelState, origin string) error {
+func launchEmbeddedCloudflared(ctx context.Context, state *CloudflareTunnelState, origin string) error {
 	logTransport := logger.Create(logger.CreateConfig("", true, false, "", ""))
 
 	observer := connection.NewObserver(logTransport, logTransport)

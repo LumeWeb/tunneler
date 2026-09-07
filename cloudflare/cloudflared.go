@@ -223,7 +223,14 @@ func (c *CloudflaredTunnel) Start(ctx context.Context, localAddr string) error {
 	publicURL := "https://" + tunneler.BareHostname(state.Hostname)
 	if err := c.waitReady(ctx, publicURL); err != nil {
 		cancel()
-		<-done
+		// Bounded teardown, mirroring the ngrok provider: a daemon that does
+		// not promptly observe cancellation must not block Start forever, so
+		// wait at most until the caller's own deadline (already spent, since
+		// waitReady just failed) releases us.
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
 		return err
 	}
 	c.setReady(publicURL)
